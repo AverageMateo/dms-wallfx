@@ -48,7 +48,8 @@ WIDE = 48.0
 
 
 def _reexec_in_venv():
-    if os.path.realpath(sys.executable) != os.path.realpath(VENV_PY) and os.path.exists(VENV_PY):
+    venv_root = os.path.join(VENV, "venv")
+    if os.path.abspath(sys.prefix) != os.path.abspath(venv_root) and os.path.exists(VENV_PY):
         os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__), *sys.argv[1:]])
 
 
@@ -196,18 +197,18 @@ _session = None
 
 def _cutout(im):
     global _session
-    os.environ.setdefault("U2NET_HOME", os.path.join(VENV, "models"))
+    import onnxruntime as ort
     from rembg import new_session, remove
     if _session is None:
+        avail = set(ort.get_available_providers())
+        provs = []
+        if "CUDAExecutionProvider" in avail:
+            provs.append("CUDAExecutionProvider")
+        if "OpenVINOExecutionProvider" in avail:
+            provs.append(("OpenVINOExecutionProvider", {"device_type": "GPU", "cache_dir": os.path.join(CACHE, "ov")}))
+        provs.append("CPUExecutionProvider")
         try:
-            _session = new_session(
-                "birefnet-general-lite",
-                providers=[
-                    "CUDAExecutionProvider",
-                    ("OpenVINOExecutionProvider", {"device_type": "GPU", "cache_dir": os.path.join(CACHE, "ov")}),
-                    "CPUExecutionProvider",
-                ],
-            )
+            _session = new_session("birefnet-general-lite", providers=provs)
         except Exception:
             _session = new_session("birefnet-general-lite", providers=["CPUExecutionProvider"])
     return remove(im, session=_session, only_mask=True)
@@ -455,8 +456,15 @@ def sync_thumbs(src_dir, dst_dir):
 
 def status():
     venv_ok = os.path.exists(VENV_PY)
-    model_dir = os.path.join(VENV, "models")
-    model_ok = os.path.isdir(model_dir) and any(f.endswith(".onnx") for f in os.listdir(model_dir))
+    model_ok = False
+    for mdir in (
+        os.path.join(HOME, ".rembg", "models", "birefnet-general-lite"),
+        os.path.join(HOME, ".u2net"),
+        os.path.join(VENV, "models"),
+    ):
+        if os.path.isdir(mdir) and any(f.endswith(".onnx") for f in os.listdir(mdir)):
+            model_ok = True
+            break
     perfil_dir = os.path.join(CACHE, "perfil")
     outlines = 0
     if os.path.isdir(perfil_dir):
