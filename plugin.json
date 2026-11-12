@@ -1,0 +1,27 @@
+{
+  "$schema": "https://github.com/AvengeMedia/DankMaterialShell/raw/refs/heads/master/PLUGINS/plugin-schema.json",
+  "id": "wallfx",
+  "name": "WallFX Transitions & Carousel",
+  "description": "Character-outline (BiRefNet) and contagion shader wallpaper transitions with a fullscreen skewed coverflow carousel",
+  "version": "1.0.0",
+  "license": "MIT",
+  "author": "AverageMateo",
+  "icon": "wallpaper",
+  "type": "daemon",
+  "capabilities": [
+    "daemon",
+    "wallpaper",
+    "ipc"
+  ],
+  "component": "./WallfxDaemon.qml",
+  "settings": "./WallfxSettings.qml",
+  "requires_dms": ">=2.0.0",
+  "dependencies": [
+    "python3"
+  ],
+  "permissions": [
+    "settings_read",
+    "settings_write",
+    "process"
+  ]
+}
