@@ -206,15 +206,10 @@ PluginComponent {
 
     function prepareMaps(k, f, l) {
         root.kind = k === "perfil" ? "perfil" : "contagio"
+        root.readyCount = 0
+        root.phase = "loading"
         root.fieldPath = f
         root.linePath = l || f
-        root.phase = "loading"
-        root.readyCount = 0
-        for (let i = 0; i < fxScreens.instances.length; i++) {
-            if (fxScreens.instances[i].loaded) {
-                root.screenReady()
-            }
-        }
     }
 
     function screenReady() {
@@ -456,9 +451,7 @@ PluginComponent {
             WlrLayershell.layer: WlrLayer.Bottom
             WlrLayershell.namespace: "dms:wallfx"
 
-            readonly property bool loaded: root.phase !== "idle"
-                && root.phase !== "choosing"
-                && oldImg.status === Image.Ready
+            readonly property bool loaded: oldImg.status === Image.Ready
                 && newImg.status === Image.Ready
                 && fieldImg.status === Image.Ready
                 && lineImg.status === Image.Ready
