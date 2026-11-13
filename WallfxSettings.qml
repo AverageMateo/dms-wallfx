@@ -256,20 +256,19 @@ PluginSettings {
     }
 
     Row {
-        width: parent.width
         spacing: Theme.spacingS
 
         Repeater {
             model: [
-                { key: "fast", title: "⚡ Fast & Snappy", desc: "~1.0s • 6px arcade cells • Quick trace" },
-                { key: "standard", title: "✨ Standard Balanced", desc: "~1.9s • 4px classic cells • Smooth flow" },
-                { key: "cinematic", title: "🎬 Slow Cinematic", desc: "~3.4s • Bold 3px neon trace • 2px liquid wave" }
+                { key: "fast", title: "Fast", desc: "~1.0s • 6px cells" },
+                { key: "standard", title: "Standard", desc: "~1.9s • 4px cells" },
+                { key: "cinematic", title: "Cinematic", desc: "~3.4s • 2px wave" }
             ]
 
             Rectangle {
                 required property var modelData
-                width: (parent.width - Theme.spacingS * 2) / 3
-                height: 68
+                width: 148
+                height: 44
                 radius: Theme.cornerRadius
                 readonly property bool isCurrent: root.activePreset === modelData.key
                 color: isCurrent
@@ -279,9 +278,9 @@ PluginSettings {
                 border.color: isCurrent ? Theme.primary : Theme.outline
 
                 Column {
-                    anchors.fill: parent
-                    anchors.margins: 10
-                    spacing: 4
+                    anchors.centerIn: parent
+                    width: parent.width - 16
+                    spacing: 1
 
                     StyledText {
                         text: parent.parent.modelData.title
@@ -294,11 +293,10 @@ PluginSettings {
 
                     StyledText {
                         text: parent.parent.modelData.desc
-                        font.pixelSize: Theme.fontSizeSmall - 1
+                        font.pixelSize: Theme.fontSizeSmall - 2
                         color: Theme.surfaceVariantText
                         width: parent.width
-                        wrapMode: Text.WordWrap
-                        maximumLineCount: 2
+                        elide: Text.ElideRight
                     }
                 }
 
