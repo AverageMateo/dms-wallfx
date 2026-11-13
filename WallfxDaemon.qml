@@ -155,6 +155,35 @@ PluginComponent {
         function stats(): string {
             return root.lastStats
         }
+
+        function preset(name: string): string {
+            const presets = {
+                "fast": {
+                    advancedTiming: true, msDraw: 380, msFill: 280, msBg: 550, stageOverlap: 25,
+                    msPerfil: 1100, msContagio: 1000, lineW: 14, outlineGlow: 20, glow: 85,
+                    cellSize: 6, parallax: 20, stageDim: 15
+                },
+                "standard": {
+                    advancedTiming: true, msDraw: 650, msFill: 600, msBg: 1000, stageOverlap: 20,
+                    msPerfil: 2000, msContagio: 1800, lineW: 18, outlineGlow: 35, glow: 90,
+                    cellSize: 4, parallax: 30, stageDim: 22
+                },
+                "cinematic": {
+                    advancedTiming: true, msDraw: 1500, msFill: 380, msBg: 1800, stageOverlap: 15,
+                    msPerfil: 3500, msContagio: 2400, lineW: 30, outlineGlow: 45, glow: 100,
+                    cellSize: 2, parallax: 50, stageDim: 30
+                }
+            }
+            const key = String(name || "").toLowerCase()
+            const p = presets[key]
+            if (!p) return "ERROR: Unknown preset '" + name + "' (use fast, standard, or cinematic)"
+            if (root.pluginService) {
+                for (const k in p) {
+                    root.pluginService.savePluginData(root.pluginId, k, p[k])
+                }
+            }
+            return "PRESET_APPLIED: " + key
+        }
     }
 
     function lifted(c) {
