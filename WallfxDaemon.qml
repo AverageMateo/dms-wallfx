@@ -20,7 +20,7 @@ PluginComponent {
     readonly property string wallfxBin: pluginDir + "/bin/wallfx"
     readonly property string thumbsDir: homeDir + "/.cache/wallfx/thumbs"
 
-    // User-configurable settings from pluginData
+    // General Settings
     readonly property string configuredWallsDir: String(root.pluginData?.wallsDir ?? "").trim()
     property string detectedWallsDir: homeDir + "/Pictures/Wallpapers"
     readonly property string wallsDir: {
@@ -31,11 +31,48 @@ PluginComponent {
     }
     readonly property string transitionMode: root.pluginData?.mode ?? "auto"
     readonly property bool interceptAllChanges: root.pluginData?.interceptAllChanges ?? true
-    readonly property int msPerfil: Number(root.pluginData?.msPerfil ?? 2000)
+
+    // Duration & Advanced Stage Timing Settings
+    readonly property bool advancedTiming: root.pluginData?.advancedTiming ?? false
+    readonly property int msPerfilSimple: Number(root.pluginData?.msPerfil ?? 2000)
     readonly property int msContagio: Number(root.pluginData?.msContagio ?? 1800)
+    readonly property int msDraw: Number(root.pluginData?.msDraw ?? 650)
+    readonly property int msFill: Number(root.pluginData?.msFill ?? 650)
+    readonly property int msBg: Number(root.pluginData?.msBg ?? 1000)
+    readonly property real stageOverlap: Math.max(0.0, Math.min(0.6, Number(root.pluginData?.stageOverlap ?? 20) / 100.0))
+
+    // Computed stage start & duration in ms when advancedTiming is enabled
+    readonly property real _advStart1: 0
+    readonly property real _advEnd1: msDraw
+    readonly property real _advStart2: msDraw * (1.0 - stageOverlap)
+    readonly property real _advEnd2: _advStart2 + msFill
+    readonly property real _advStart3: _advStart2 + msFill * (1.0 - stageOverlap)
+    readonly property real _advEnd3: _advStart3 + msBg
+    readonly property int msPerfilTotal: advancedTiming
+        ? Math.max(400, Math.round(Math.max(_advEnd1, _advEnd2, _advEnd3)))
+        : msPerfilSimple
+
+    readonly property real tDrawStart: advancedTiming ? (_advStart1 / msPerfilTotal) : 0.02
+    readonly property real tDrawDur: advancedTiming ? (msDraw / msPerfilTotal) : 0.33
+    readonly property real tFillStart: advancedTiming ? (_advStart2 / msPerfilTotal) : 0.32
+    readonly property real tFillDur: advancedTiming ? (msFill / msPerfilTotal) : 0.32
+    readonly property real tBgStart: advancedTiming ? (_advStart3 / msPerfilTotal) : 0.45
+    readonly property real tBgDur: advancedTiming ? (msBg / msPerfilTotal) : 0.50
+
     readonly property int msFade: 140
+
+    // Shader Visual Settings
     readonly property real glow: Number(root.pluginData?.glow ?? 90) / 100.0
+    readonly property real outlineGlow: Number(root.pluginData?.outlineGlow ?? 35) / 100.0
     readonly property real lineW: Number(root.pluginData?.lineW ?? 15) / 10.0
+    readonly property real cellSize: Math.max(1.0, Number(root.pluginData?.cellSize ?? 4))
+    readonly property real parallax: Number(root.pluginData?.parallax ?? 30) / 1000.0
+    readonly property real stageDim: Number(root.pluginData?.stageDim ?? 20) / 100.0
+
+    // Color Settings
+    readonly property string colorMode: root.pluginData?.colorMode ?? "auto"
+    readonly property color customInkColor: root.pluginData?.customInkColor ?? "#ffffff"
+    readonly property color customEmberColor: root.pluginData?.customEmberColor ?? "#ff9e64"
 
     // Carousel state
     property bool carouselOpen: false
@@ -130,6 +167,16 @@ PluginComponent {
     }
 
     function pickColors() {
+        if (root.colorMode === "custom") {
+            root.ink = root.customInkColor
+            root.ember = root.customEmberColor
+            return
+        }
+        if (root.colorMode === "accent") {
+            root.ink = root.lifted(Theme.primary)
+            root.ember = root.lifted(Theme.secondary)
+            return
+        }
         const pal = [
             Theme.primary,
             Theme.secondary,
@@ -225,7 +272,7 @@ PluginComponent {
         root.pickColors()
         root.seed = Math.random() * 100
         root.phase = "run"
-        runAnim.duration = root.kind === "perfil" ? root.msPerfil : root.msContagio
+        runAnim.duration = root.kind === "perfil" ? root.msPerfilTotal : root.msContagio
         runAnim.restart()
         if (root.externalSwap) {
             root.fade = 1
@@ -535,14 +582,24 @@ PluginComponent {
                 property real lw: Math.max(lineImg.implicitWidth, 1)
                 property real lh: Math.max(lineImg.implicitHeight, 1)
                 property real glow: root.glow
+                property real outlineGlow: root.outlineGlow
                 property real lineW: root.lineW
+                property real cellSize: root.cellSize
+                property real parallax: root.parallax
+                property real stageDim: root.stageDim
+                property real tDrawStart: root.tDrawStart
+                property real tDrawDur: root.tDrawDur
+                property real tFillStart: root.tFillStart
+                property real tFillDur: root.tFillDur
+                property real tBgStart: root.tBgStart
+                property real tBgDur: root.tBgDur
                 property real sdRange: 16
                 property real seed: root.seed
                 property vector4d cropOld: fxWin.crop(oldImg)
                 property vector4d cropNew: fxWin.crop(newImg)
                 property color ember: root.ember
                 property color ink: root.ink
-                fragmentShader: Qt.resolvedUrl("shaders/wallfx.v15.frag.qsb")
+                fragmentShader: Qt.resolvedUrl("shaders/wallfx.v16.frag.qsb")
             }
         }
     }
