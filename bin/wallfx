@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""wallfx — Character-outline (BiRefNet) and contagion map generator for DMS WallFX.
+"""wallfx — Resource-capped character-outline and contagion map generator for DMS WallFX.
 
 Commands:
-    wallfx spread                          Print a contagion map pair from the pool
-    wallfx perfil IMG [--force]            Print IMG's outline map pair (exit 1 if no subject)
-    wallfx warm [DIR]                      Precompute contagion pool + outline maps for DIR
-    wallfx elige [--mode MODE] IMG         Print "perfil <campo> <linea>" or "contagio <map> <liso>"
-    wallfx thumbs [SRC_DIR] [DST_DIR]      Sync 900x420 carousel thumbnails
-    wallfx install                         Create ~/.local/share/wallfx/venv & prebuild spread pool
-    wallfx status                          Print JSON status of venv, model, and caches
+    wallfx spread                                       Print a contagion map pair from the pool
+    wallfx perfil IMG [--force] [--model MODEL]         Print IMG's outline map pair
+    wallfx warm [DIR] [--model MODEL] [--threads N]     Precompute contagion pool + outline maps gently
+    wallfx elige [--mode MODE] [--model MODEL] IMG      Print "perfil <campo> <linea>" or "contagio <map> <liso>"
+    wallfx thumbs [SRC_DIR] [DST_DIR]                   Sync 900x420 carousel thumbnails sequentially
+    wallfx install                                      Create ~/.local/share/wallfx/venv with low priority
+    wallfx status                                       Print JSON status of venv, model, and caches
 """
+import ctypes
 import fcntl
+import gc
 import hashlib
 import heapq
 import json
@@ -21,11 +23,25 @@ import subprocess
 import sys
 import time
 
+# Cap math/BLAS/OpenMP threads BEFORE importing numpy, cv2, or onnxruntime
+DEFAULT_THREADS = max(1, min(4, int(os.environ.get("WALLFX_THREADS", "2"))))
+for _env_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_env_var, str(DEFAULT_THREADS))
+
 HOME = os.path.expanduser("~")
 CACHE = os.path.join(HOME, ".cache", "wallfx")
 THUMBS_DEFAULT = os.path.join(CACHE, "thumbs")
 VENV = os.path.join(HOME, ".local", "share", "wallfx")
 VENV_PY = os.path.join(VENV, "venv", "bin", "python")
+
+# Default to isnet-general-use (~1.0 GB RAM instead of birefnet-general-lite's ~6.9 GB RAM)
+DEFAULT_MODEL = os.environ.get("WALLFX_MODEL", "isnet-general-use")
 
 
 def default_walls_dir():
@@ -47,6 +63,36 @@ SD_RANGE = 16.0
 WIDE = 48.0
 
 
+def _lower_priority():
+    """Lower CPU scheduling priority so desktop/compositor responsiveness is never impacted."""
+    try:
+        os.nice(15)
+    except OSError:
+        pass
+
+
+def _trim_memory():
+    """Force Python GC and glibc malloc_trim(0) to return freed heap pages to the OS immediately."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _available_ram_mb():
+    """Return MemAvailable from /proc/meminfo in MB (or 8192 if unavailable)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 8192
+
+
 def _reexec_in_venv():
     venv_root = os.path.join(VENV, "venv")
     if os.path.abspath(sys.prefix) != os.path.abspath(venv_root) and os.path.exists(VENV_PY):
@@ -58,10 +104,10 @@ def _reexec_in_venv():
 def _value_noise(rng, w, h, scale):
     import numpy as np
     nx, ny = int(w / scale) + 3, int(h / scale) + 3
-    lat = rng.random((ny, nx))
-    xs = np.arange(w) / scale
-    ys = np.arange(h) / scale
-    ix, iy = xs.astype(int), ys.astype(int)
+    lat = rng.random((ny, nx), dtype=np.float32)
+    xs = (np.arange(w, dtype=np.float32) / scale)
+    ys = (np.arange(h, dtype=np.float32) / scale)
+    ix, iy = xs.astype(np.int32), ys.astype(np.int32)
     fx, fy = xs - ix, ys - iy
     fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
     top = lat[iy][:, ix] * (1 - fx) + lat[iy][:, ix + 1] * fx
@@ -72,7 +118,7 @@ def _value_noise(rng, w, h, scale):
 def _blur(a, sigma):
     import numpy as np
     r = int(3 * sigma) + 1
-    x = np.arange(-r, r + 1)
+    x = np.arange(-r, r + 1, dtype=np.float32)
     k = np.exp(-x * x / (2.0 * sigma * sigma))
     k /= k.sum()
     a = np.pad(a, r, mode="edge")
@@ -125,10 +171,10 @@ def _arrival(cost, seeds, GW=GW, GH=GH):
 
 def _ranked(arrival, shape=(GH, GW)):
     import numpy as np
-    a = np.array(arrival)
-    rank = np.empty(a.size)
-    rank[np.argsort(a, kind="stable")] = np.arange(a.size)
-    return (rank / (a.size - 1) * 65535).astype(np.uint16).reshape(shape)
+    a = np.asarray(arrival, dtype=np.float32)
+    rank = np.empty(a.size, dtype=np.int32)
+    rank[np.argsort(a, kind="stable")] = np.arange(a.size, dtype=np.int32)
+    return (rank.astype(np.float32) / max(a.size - 1, 1) * 65535).astype(np.uint16).reshape(shape)
 
 
 def contagion_map(seed):
@@ -140,7 +186,7 @@ def contagion_map(seed):
         + 0.30 * _value_noise(rng, w, h, rng.uniform(7, 20))
         + 0.18 * _value_noise(rng, w, h, rng.uniform(2, 6))
     )
-    cost = 0.12 + np.exp(rng.uniform(5, 9) * (n - 0.5)) + rng.uniform(0.15, 0.65) * rng.random((h, w))
+    cost = 0.12 + np.exp(rng.uniform(5, 9) * (n - 0.5)) + rng.uniform(0.15, 0.65) * rng.random((h, w), dtype=np.float32)
     cost = cost.ravel().tolist()
     seeds = []
     for _ in range(int(rng.integers(6, 13))):
@@ -156,7 +202,7 @@ def _write_pair(path, liso, a):
     rgb = np.zeros((h, w, 3), np.uint8)
     rgb[..., 0] = a >> 8
     rgb[..., 1] = a & 255
-    smooth = _blur(a.astype(np.float64) / 65535.0, 2.5)
+    smooth = _blur(a.astype(np.float32) / 65535.0, 2.5)
     for dest, arr in ((path, rgb), (liso, _rgb16(smooth))):
         tmp = f"{dest}.{os.getpid()}.tmp.png"
         Image.fromarray(arr, "RGB").save(tmp)
@@ -175,6 +221,7 @@ def spread():
 
 
 def renew(path):
+    _lower_priority()
     time.sleep(4)
     k = os.path.basename(path).split("-")[1].split(".")[0]
     d = os.path.dirname(path)
@@ -193,28 +240,66 @@ def _key(img):
 
 
 _session = None
+_session_model = None
 
 
-def _cutout(im):
-    global _session
-    import onnxruntime as ort
-    from rembg import new_session, remove
-    if _session is None:
-        avail = set(ort.get_available_providers())
-        provs = []
-        if "CUDAExecutionProvider" in avail:
-            provs.append("CUDAExecutionProvider")
-        if "OpenVINOExecutionProvider" in avail:
-            provs.append(("OpenVINOExecutionProvider", {"device_type": "GPU", "cache_dir": os.path.join(CACHE, "ov")}))
-        provs.append("CPUExecutionProvider")
-        try:
-            _session = new_session("birefnet-general-lite", providers=provs)
-        except Exception:
-            _session = new_session("birefnet-general-lite", providers=["CPUExecutionProvider"])
-    return remove(im, session=_session, only_mask=True)
+def _select_safe_model(requested_model):
+    """Ensure the chosen model fits comfortably in available RAM."""
+    avail_mb = _available_ram_mb()
+    if avail_mb < 1400:
+        return None  # Too low on RAM right now; fall back to contagion safely
+    if requested_model == "birefnet-general-lite" and avail_mb < 8500:
+        # birefnet-general-lite uses ~6.9 GB RSS on CPU; downgrade automatically on <8.5 GB free RAM
+        return "isnet-general-use" if avail_mb >= 2200 else "u2net"
+    if requested_model in ("isnet-general-use", "isnet-anime") and avail_mb < 2000:
+        return "u2net"
+    return requested_model
 
 
-def perfil(img, force=False):
+def _cutout(im, model_name=DEFAULT_MODEL, num_threads=DEFAULT_THREADS):
+    global _session, _session_model
+    safe_model = _select_safe_model(model_name)
+    if safe_model is None:
+        return None
+
+    # Serialize model execution across processes so two sessions never coexist in RAM
+    os.makedirs(CACHE, exist_ok=True)
+    global_lock = open(os.path.join(CACHE, ".cutout.lock"), "w")
+    fcntl.flock(global_lock, fcntl.LOCK_EX)
+    try:
+        import onnxruntime as ort
+        from rembg import new_session, remove
+
+        if _session is None or _session_model != safe_model:
+            _session = None
+            _trim_memory()
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = max(1, min(4, int(num_threads)))
+            opts.inter_op_num_threads = 1
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            opts.enable_cpu_mem_arena = False
+            opts.enable_mem_pattern = False
+
+            avail = set(ort.get_available_providers())
+            provs = []
+            if "CUDAExecutionProvider" in avail:
+                provs.append("CUDAExecutionProvider")
+            if "OpenVINOExecutionProvider" in avail:
+                provs.append(("OpenVINOExecutionProvider", {"device_type": "GPU", "cache_dir": os.path.join(CACHE, "ov")}))
+            provs.append("CPUExecutionProvider")
+            try:
+                _session = new_session(safe_model, sess_opts=opts, providers=provs)
+            except Exception:
+                _session = new_session(safe_model, sess_opts=opts, providers=["CPUExecutionProvider"])
+            _session_model = safe_model
+
+        return remove(im, session=_session, only_mask=True)
+    finally:
+        fcntl.flock(global_lock, fcntl.LOCK_UN)
+        global_lock.close()
+
+
+def perfil(img, force=False, model_name=DEFAULT_MODEL, num_threads=DEFAULT_THREADS):
     d = os.path.join(CACHE, "perfil")
     os.makedirs(d, exist_ok=True)
     base = os.path.join(d, _key(img))
@@ -233,95 +318,106 @@ def perfil(img, force=False):
     except ImportError:
         return None
 
+    cv2.setNumThreads(max(1, min(4, int(num_threads))))
+
     lock = open(base + ".lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
-    if not force and os.path.exists(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            meta = json.load(f)
-        if not meta.get("ok"):
-            return None
-        if os.path.exists(base + "-campo.png") and os.path.exists(base + "-linea.png"):
-            return base + "-campo.png", base + "-linea.png"
+    try:
+        if not force and os.path.exists(meta_path):
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            if not meta.get("ok"):
+                return None
+            if os.path.exists(base + "-campo.png") and os.path.exists(base + "-linea.png"):
+                return base + "-campo.png", base + "-linea.png"
 
-    im = Image.open(img).convert("RGB")
-    im.thumbnail((FIELD_MAX, FIELD_MAX))
-    mask_path = base + "-mascara.png"
-    if os.path.exists(mask_path):
-        mask = Image.open(mask_path).convert("L")
-    else:
-        mask = _cutout(im).convert("L")
-        mask.save(mask_path)
-    m = np.asarray(mask.resize(im.size), np.float32) / 255.0
-    h, w = m.shape
-    b = (m > 0.5).astype(np.uint8)
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(b, connectivity=8)
-    keep = np.zeros(n, bool)
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 0.002 * w * h
-    b = keep[lab].astype(np.uint8)
-    cover = float(b.mean())
-    unsure = float(((m > 0.1) & (m < 0.9)).mean())
-    ok = 0.008 <= cover <= 0.72 and unsure <= 0.06
-    meta = {"img": img, "ok": ok, "cover": round(cover, 3), "unsure": round(unsure, 3), "w": w, "h": h}
-    if not ok:
+        im = Image.open(img).convert("RGB")
+        im.thumbnail((FIELD_MAX, FIELD_MAX))
+        mask_path = base + "-mascara.png"
+        if not force and os.path.exists(mask_path):
+            mask = Image.open(mask_path).convert("L")
+        else:
+            raw_mask = _cutout(im, model_name=model_name, num_threads=num_threads)
+            if raw_mask is None:
+                return None
+            mask = raw_mask.convert("L")
+            mask.save(mask_path)
+        m = np.asarray(mask.resize(im.size), np.float32) / 255.0
+        h, w = m.shape
+        b = (m > 0.5).astype(np.uint8)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(b, connectivity=8)
+        keep = np.zeros(n, bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 0.002 * w * h
+        b = keep[lab].astype(np.uint8)
+        cover = float(b.mean())
+        unsure = float(((m > 0.1) & (m < 0.9)).mean())
+        ok = 0.008 <= cover <= 0.72 and unsure <= 0.075
+        meta = {"img": img, "ok": ok, "cover": round(cover, 3), "unsure": round(unsure, 3), "w": w, "h": h}
+        if not ok:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            return None
+
+        din = cv2.distanceTransform(b, cv2.DIST_L2, 5)
+        dout = cv2.distanceTransform(1 - b, cv2.DIST_L2, 5)
+        sd = dout - din
+
+        inner = np.clip(din / max(float(np.percentile(din[b > 0], 99)), 1.0), 0, 1)
+
+        rng = np.random.default_rng(int(_key(img)[:8], 16))
+        noise = 0.6 * _value_noise(rng, w, h, w / 9.0) + 0.4 * _value_noise(rng, w, h, w / 28.0)
+        warped = (dout * (0.75 + 0.5 * noise) + noise * 0.08 * max(w, h)).astype(np.float32)
+        outside = b == 0
+        order = np.zeros((h, w), np.float32)
+        vals = warped[outside]
+        r = np.empty(vals.size, dtype=np.int32)
+        r[np.argsort(vals, kind="stable")] = np.arange(vals.size, dtype=np.int32)
+        order[outside] = r.astype(np.float32) / max(vals.size - 1, 1)
+        del vals, r, warped, noise
+
+        edge = np.zeros((h, w), np.uint8)
+        param_at = np.zeros((h, w), np.float32)
+        contours, _ = cv2.findContours(b, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        for c in contours:
+            if len(c) < 40 or abs(cv2.contourArea(c)) < 0.0008 * w * h:
+                continue
+            c = c[:, 0, :]
+            seg = np.sqrt((np.diff(c, axis=0, append=c[:1]) ** 2).sum(1))
+            s = np.concatenate([[0], np.cumsum(seg)[:-1]])
+            L = s[-1] + seg[-1]
+            s = (s - s[np.argmin(c[:, 1])]) % L
+            p = np.minimum(s, L - s) / (L / 2)
+            p[(c[:, 0] <= 1) | (c[:, 0] >= w - 2) | (c[:, 1] <= 1) | (c[:, 1] >= h - 2)] = -1
+            edge[c[:, 1], c[:, 0]] = 1
+            param_at[c[:, 1], c[:, 0]] = p
+        line = np.zeros((h, w), np.uint8)
+        if edge.any():
+            _, labels = cv2.distanceTransformWithLabels(
+                1 - edge, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+            )
+            ys, xs = np.nonzero(edge)
+            table = np.concatenate([[0], param_at[ys, xs]])
+            near = np.abs(sd) < SD_RANGE
+            v = table[labels[near]]
+            line[near] = np.where(v < 0, 0, np.clip(v * 255, 1, 255)).astype(np.uint8)
+
+        rgb = np.zeros((h, w, 3), np.uint8)
+        rgb[..., 0] = np.clip(dout / WIDE * 255, 0, 255)
+        rgb[..., 1] = np.clip(inner * 255, 0, 255)
+        rgb[..., 2] = np.clip((sd + SD_RANGE) / (2 * SD_RANGE) * 255, 0, 255)
+        smooth = cv2.GaussianBlur(order, (0, 0), 4.0)
+        linea = _rgb16(smooth, extra=line)
+        for suffix, arr, mode in (("-campo.png", rgb, "RGB"), ("-linea.png", linea, "RGB")):
+            tmp = f"{base}{suffix}.{os.getpid()}.tmp.png"
+            Image.fromarray(arr, mode).save(tmp)
+            os.replace(tmp, base + suffix)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f)
-        return None
-
-    din = cv2.distanceTransform(b, cv2.DIST_L2, 5)
-    dout = cv2.distanceTransform(1 - b, cv2.DIST_L2, 5)
-    sd = dout - din
-
-    inner = np.clip(din / max(np.percentile(din[b > 0], 99), 1.0), 0, 1)
-
-    rng = np.random.default_rng(int(_key(img)[:8], 16))
-    noise = 0.6 * _value_noise(rng, w, h, w / 9.0) + 0.4 * _value_noise(rng, w, h, w / 28.0)
-    warped = dout * (0.75 + 0.5 * noise) + noise * 0.08 * max(w, h)
-    outside = b == 0
-    order = np.zeros((h, w), np.float32)
-    vals = warped[outside]
-    r = np.empty(vals.size)
-    r[np.argsort(vals, kind="stable")] = np.arange(vals.size)
-    order[outside] = r / max(vals.size - 1, 1)
-
-    edge = np.zeros((h, w), np.uint8)
-    param_at = np.zeros((h, w), np.float32)
-    contours, _ = cv2.findContours(b, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    for c in contours:
-        if len(c) < 40 or abs(cv2.contourArea(c)) < 0.0008 * w * h:
-            continue
-        c = c[:, 0, :]
-        seg = np.sqrt((np.diff(c, axis=0, append=c[:1]) ** 2).sum(1))
-        s = np.concatenate([[0], np.cumsum(seg)[:-1]])
-        L = s[-1] + seg[-1]
-        s = (s - s[np.argmin(c[:, 1])]) % L
-        p = np.minimum(s, L - s) / (L / 2)
-        p[(c[:, 0] <= 1) | (c[:, 0] >= w - 2) | (c[:, 1] <= 1) | (c[:, 1] >= h - 2)] = -1
-        edge[c[:, 1], c[:, 0]] = 1
-        param_at[c[:, 1], c[:, 0]] = p
-    line = np.zeros((h, w), np.uint8)
-    if edge.any():
-        _, labels = cv2.distanceTransformWithLabels(
-            1 - edge, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
-        )
-        ys, xs = np.nonzero(edge)
-        table = np.concatenate([[0], param_at[ys, xs]])
-        near = np.abs(sd) < SD_RANGE
-        v = table[labels[near]]
-        line[near] = np.where(v < 0, 0, np.clip(v * 255, 1, 255)).astype(np.uint8)
-
-    rgb = np.zeros((h, w, 3), np.uint8)
-    rgb[..., 0] = np.clip(dout / WIDE * 255, 0, 255)
-    rgb[..., 1] = np.clip(inner * 255, 0, 255)
-    rgb[..., 2] = np.clip((sd + SD_RANGE) / (2 * SD_RANGE) * 255, 0, 255)
-    smooth = cv2.GaussianBlur(order.astype(np.float32), (0, 0), 4.0)
-    linea = _rgb16(smooth, extra=line)
-    for suffix, arr, mode in (("-campo.png", rgb, "RGB"), ("-linea.png", linea, "RGB")):
-        tmp = f"{base}{suffix}.{os.getpid()}.tmp.png"
-        Image.fromarray(arr, mode).save(tmp)
-        os.replace(tmp, base + suffix)
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-    return base + "-campo.png", base + "-linea.png"
+        return base + "-campo.png", base + "-linea.png"
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        _trim_memory()
 
 
 def contagio(_img=None):
@@ -346,50 +442,73 @@ def sin_perfil():
         return set()
 
 
-def warm(folder):
+def _is_cached(img):
+    base = os.path.join(CACHE, "perfil", _key(img))
+    meta_path = base + ".json"
+    if not os.path.exists(meta_path):
+        return False
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        if not meta.get("ok"):
+            return True
+        return os.path.exists(base + "-campo.png") and os.path.exists(base + "-linea.png")
+    except Exception:
+        return False
+
+
+def warm(folder, model_name=DEFAULT_MODEL, num_threads=DEFAULT_THREADS):
+    _lower_priority()
     os.makedirs(CACHE, exist_ok=True)
     lock = open(os.path.join(CACHE, ".warm.lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return
+
+    # 1) Build at most 3 initial contagion maps if missing, then top up gently
     d = os.path.join(CACHE, "spread")
     os.makedirs(d, exist_ok=True)
     for k in range(POOL):
         path, liso = os.path.join(d, f"spread-{k}.png"), os.path.join(d, f"spread-{k}-liso.png")
         if not (os.path.exists(path) and os.path.exists(liso)):
             _write_pair(path, liso, contagion_map(random.randrange(1 << 30)))
+            _trim_memory()
+            time.sleep(0.1)
+
     if not os.path.isdir(folder):
         return
     exts = (".jpg", ".jpeg", ".png", ".webp")
 
-    def listing():
-        out = []
-        for name in sorted(os.listdir(folder)):
-            path = os.path.join(folder, name)
-            if name.lower().endswith(exts) and os.path.isfile(path):
-                st = os.stat(path)
-                out.append((name, st.st_size, int(st.st_mtime)))
-        return out
-
-    seen = None
-    for _ in range(6):
-        now = listing()
-        if now == seen:
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if not (name.lower().endswith(exts) and os.path.isfile(path)):
+            continue
+        if _is_cached(path):
+            continue
+        if _available_ram_mb() < 1500:
+            print("paused    low available RAM (<1.5 GB), stopping background warm", file=sys.stderr, flush=True)
             break
-        for name, _, _ in now:
-            try:
-                r = perfil(os.path.join(folder, name))
-                print(("perfil  " if r else "contagio") + "  " + name, flush=True)
-            except Exception as e:
-                print(f"error     {name}: {e}", file=sys.stderr, flush=True)
-        seen = now
+        try:
+            r = perfil(path, model_name=model_name, num_threads=num_threads)
+            print(("perfil  " if r else "contagio") + "  " + name, flush=True)
+        except Exception as e:
+            print(f"error     {name}: {e}", file=sys.stderr, flush=True)
+        _trim_memory()
+        time.sleep(0.35)
 
 
 def sync_thumbs(src_dir, dst_dir):
+    _lower_priority()
     if not os.path.isdir(src_dir):
         return 0
     os.makedirs(dst_dir, exist_ok=True)
+    lock = open(os.path.join(CACHE, ".thumbs.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+
     exts = (".jpg", ".jpeg", ".png", ".webp")
     valid_names = set()
     to_build = []
@@ -407,26 +526,29 @@ def sync_thumbs(src_dir, dst_dir):
 
     magick = shutil.which("magick")
     if magick and to_build:
-        procs = []
+        # Process 1 image at a time with memory/thread limits so ImageMagick never spikes RAM
         for src_path, dst_path in to_build:
             tmp_path = f"{dst_path}.{os.getpid()}.tmp.jpg"
-            p = subprocess.Popen(
-                [magick, src_path, "-auto-orient", "-thumbnail", "900x420^", "-strip", "-quality", "85", tmp_path],
+            res = subprocess.run(
+                [
+                    magick,
+                    "-limit", "thread", "2",
+                    "-limit", "memory", "256MiB",
+                    "-limit", "map", "512MiB",
+                    src_path,
+                    "-auto-orient",
+                    "-thumbnail", "900x420^",
+                    "-strip",
+                    "-quality", "85",
+                    tmp_path,
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            procs.append((p, tmp_path, dst_path))
-            if len(procs) >= 4:
-                p0, t0, d0 = procs.pop(0)
-                if p0.wait() == 0 and os.path.exists(t0):
-                    os.replace(t0, d0)
-                elif os.path.exists(t0):
-                    os.remove(t0)
-        for p0, t0, d0 in procs:
-            if p0.wait() == 0 and os.path.exists(t0):
-                os.replace(t0, d0)
-            elif os.path.exists(t0):
-                os.remove(t0)
+            if res.returncode == 0 and os.path.exists(tmp_path):
+                os.replace(tmp_path, dst_path)
+            elif os.path.exists(tmp_path):
+                os.remove(tmp_path)
     elif to_build:
         _reexec_in_venv()
         try:
@@ -442,6 +564,7 @@ def sync_thumbs(src_dir, dst_dir):
                 except Exception:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
+                _trim_memory()
         except ImportError:
             pass
 
@@ -458,6 +581,9 @@ def status():
     venv_ok = os.path.exists(VENV_PY)
     model_ok = False
     for mdir in (
+        os.path.join(HOME, ".rembg", "models", "isnet-general-use"),
+        os.path.join(HOME, ".rembg", "models", "isnet-anime"),
+        os.path.join(HOME, ".rembg", "models", "u2net"),
         os.path.join(HOME, ".rembg", "models", "birefnet-general-lite"),
         os.path.join(HOME, ".u2net"),
         os.path.join(VENV, "models"),
@@ -484,6 +610,7 @@ def status():
 
 
 def install():
+    _lower_priority()
     os.makedirs(VENV, exist_ok=True)
     lock_file = open(os.path.join(VENV, ".install.lock"), "w")
     try:
@@ -494,20 +621,56 @@ def install():
 
     venv_dir = os.path.join(VENV, "venv")
     pkgs = ["rembg", "onnxruntime", "opencv-python-headless", "numpy", "pillow"]
+    env = os.environ.copy()
+    env["UV_CONCURRENT_INSTALLS"] = "2"
+    env["UV_CONCURRENT_DOWNLOADS"] = "2"
+    env["UV_CONCURRENT_BUILDS"] = "1"
+
     uv = shutil.which("uv")
     if uv:
-        subprocess.run([uv, "venv", "-q", venv_dir], check=True)
-        subprocess.run([uv, "pip", "install", "-q", "--python", VENV_PY, *pkgs], check=True)
+        subprocess.run([uv, "venv", "-q", venv_dir], check=True, env=env)
+        subprocess.run([uv, "pip", "install", "-q", "--python", VENV_PY, *pkgs], check=True, env=env)
     else:
-        subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True)
+        subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True, env=env)
         pip_bin = os.path.join(venv_dir, "bin", "pip")
-        subprocess.run([pip_bin, "install", "-q", "--upgrade", "pip"], check=True)
-        subprocess.run([pip_bin, "install", "-q", *pkgs], check=True)
+        subprocess.run([pip_bin, "install", "-q", "--upgrade", "pip"], check=True, env=env)
+        subprocess.run([pip_bin, "install", "-q", *pkgs], check=True, env=env)
 
-    # Prebuild the contagion pool using the newly created venv
-    subprocess.run([VENV_PY, os.path.abspath(__file__), "spread"], check=True, stdout=subprocess.DEVNULL)
+    # Prebuild a single spread map so immediate contagion transitions work without spiking CPU
+    subprocess.run([VENV_PY, os.path.abspath(__file__), "spread"], check=True, stdout=subprocess.DEVNULL, env=env)
     print("ready: wallfx environment installed")
     return 0
+
+
+def _parse_opts(rest):
+    mode = "auto"
+    model_name = DEFAULT_MODEL
+    threads = DEFAULT_THREADS
+    force = False
+    no_wait = False
+    pos = []
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--mode" and i + 1 < len(rest):
+            mode = rest[i + 1]
+            i += 2
+        elif arg == "--model" and i + 1 < len(rest):
+            model_name = rest[i + 1]
+            i += 2
+        elif arg == "--threads" and i + 1 < len(rest):
+            threads = max(1, min(8, int(rest[i + 1])))
+            i += 2
+        elif arg == "--force":
+            force = True
+            i += 1
+        elif arg == "--sin-esperar":
+            no_wait = True
+            i += 1
+        else:
+            pos.append(arg)
+            i += 1
+    return mode, model_name, threads, force, no_wait, pos
 
 
 def main(argv):
@@ -524,34 +687,24 @@ def main(argv):
         dst = rest[1] if len(rest) >= 2 and rest[1] else THUMBS_DEFAULT
         return sync_thumbs(os.path.expanduser(src), os.path.expanduser(dst))
 
-    # All image/math commands run inside the venv if available
     _reexec_in_venv()
+    mode, model_name, threads, force, no_wait, pos = _parse_opts(rest)
 
     if cmd == "spread":
         print(*contagio(None))
         return 0
     if cmd == "perfil":
-        r = perfil(os.path.expanduser(rest[0]), force="--force" in rest)
+        r = perfil(os.path.expanduser(pos[0]), force=force, model_name=model_name, num_threads=threads)
         if not r:
             return 1
         print(*r)
         return 0
     if cmd == "warm":
-        target = os.path.expanduser(rest[0]) if rest else WALLS
-        warm(target)
+        target = os.path.expanduser(pos[0]) if pos else WALLS
+        warm(target, model_name=model_name, num_threads=threads)
         return 0
     if cmd == "elige":
-        mode = "auto"
-        args = []
-        i = 0
-        while i < len(rest):
-            if rest[i] == "--mode" and i + 1 < len(rest):
-                mode = rest[i + 1]
-                i += 2
-            else:
-                args.append(rest[i])
-                i += 1
-        img = os.path.expanduser(args[0])
+        img = os.path.expanduser(pos[0])
         if mode == "contagion" or os.path.basename(img) in sin_perfil():
             print("contagio", *contagio(img))
             return 0
@@ -565,14 +718,14 @@ def main(argv):
         if meta is not None:
             if meta.get("ok") and os.path.exists(base + "-campo.png") and os.path.exists(base + "-linea.png"):
                 r = (base + "-campo.png", base + "-linea.png")
-        elif os.path.exists(VENV_PY) and "--sin-esperar" not in args:
+        elif os.path.exists(VENV_PY) and not no_wait:
             import signal
             def _timeout(*_):
                 raise TimeoutError
             signal.signal(signal.SIGALRM, _timeout)
             signal.alarm(25)
             try:
-                r = perfil(img)
+                r = perfil(img, model_name=model_name, num_threads=threads)
             except Exception:
                 r = None
             finally:

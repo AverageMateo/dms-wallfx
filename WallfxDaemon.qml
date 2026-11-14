@@ -31,6 +31,9 @@ PluginComponent {
     }
     readonly property string transitionMode: root.pluginData?.mode ?? "auto"
     readonly property bool interceptAllChanges: root.pluginData?.interceptAllChanges ?? true
+    readonly property string cutoutModel: root.pluginData?.cutoutModel ?? "isnet-general-use"
+    readonly property int maxThreads: Math.max(1, Math.min(8, Number(root.pluginData?.maxThreads ?? 2)))
+    readonly property bool autoWarm: root.pluginData?.autoWarm ?? false
 
     // Duration & Advanced Stage Timing Settings
     readonly property bool advancedTiming: root.pluginData?.advancedTiming ?? false
@@ -143,7 +146,7 @@ PluginComponent {
         }
 
         function warm(): string {
-            root.warmTransitions()
+            root.warmTransitions(true)
             return "WARMING: " + root.wallsDir
         }
 
@@ -223,14 +226,20 @@ PluginComponent {
     }
 
     function refreshThumbs() {
+        if (thumbsProc.running) return
         thumbsProc.command = [root.wallfxBin, "thumbs", root.wallsDir, root.thumbsDir]
-        thumbsProc.running = false
         thumbsProc.running = true
     }
 
-    function warmTransitions() {
-        if (!warmProc.running) {
-            warmProc.command = [root.wallfxBin, "warm", root.wallsDir]
+    function warmTransitions(forceManual) {
+        if (!forceManual && !root.autoWarm) return
+        if (!warmProc.running && !thumbsProc.running && !eligeProc.running) {
+            warmProc.command = [
+                root.wallfxBin, "warm",
+                "--model", root.cutoutModel,
+                "--threads", String(root.maxThreads),
+                root.wallsDir
+            ]
             warmProc.running = true
         }
     }
@@ -238,7 +247,7 @@ PluginComponent {
     function ensureVenv(notifyStart) {
         if (installProc.running) return
         if (notifyStart) {
-            ToastService.showInfo("WallFX", "Setting up BiRefNet cutout environment in ~/.local/share/wallfx…")
+            ToastService.showInfo("WallFX", "Setting up lightweight cutout environment in ~/.local/share/wallfx…")
         }
         installProc.command = [root.wallfxBin, "install"]
         installProc.running = true
@@ -263,6 +272,11 @@ PluginComponent {
             root.finish()
         }
 
+        // Pause background warming if active so the selected wallpaper never competes for RAM/CPU
+        if (warmProc.running) {
+            warmProc.running = false
+        }
+
         root.oldPath = prev
         root.newPath = targetNewPath
         root.externalSwap = isExternal
@@ -275,7 +289,13 @@ PluginComponent {
         watchdog.restart()
 
         eligeProc.targetGen = root.gen
-        eligeProc.command = [root.wallfxBin, "elige", "--mode", root.transitionMode, targetNewPath]
+        eligeProc.command = [
+            root.wallfxBin, "elige",
+            "--mode", root.transitionMode,
+            "--model", root.cutoutModel,
+            "--threads", String(root.maxThreads),
+            targetNewPath
+        ]
         eligeProc.running = false
         eligeProc.running = true
     }
@@ -471,7 +491,6 @@ PluginComponent {
                         root.ensureVenv(true)
                     } else {
                         root.refreshThumbs()
-                        root.warmTransitions()
                     }
                 } catch (e) {}
             }
@@ -482,9 +501,8 @@ PluginComponent {
         id: installProc
         onExited: (code) => {
             if (code === 0) {
-                ToastService.showInfo("WallFX", "Cutout environment ready! Warming wallpaper outlines in background.")
+                ToastService.showInfo("WallFX", "Environment ready! Outlines will be generated on-demand as you pick wallpapers.")
                 root.refreshThumbs()
-                root.warmTransitions()
             } else {
                 ToastService.showError("WallFX", "Failed to set up Python environment (exit " + code + ")")
             }
@@ -497,6 +515,9 @@ PluginComponent {
             if (wallModel.count === 0) {
                 wallModel.folder = ""
                 wallModel.folder = "file://" + root.thumbsDir
+            }
+            if (root.autoWarm) {
+                root.warmTransitions(false)
             }
         }
     }

@@ -346,6 +346,44 @@ PluginSettings {
         defaultValue: ""
     }
 
+    // ─────────────────── Performance & Resource Limits ───────────────────
+    StyledText {
+        text: "Performance & Resource Limits"
+        font.pixelSize: Theme.fontSizeMedium
+        font.weight: Font.Bold
+        color: Theme.primary
+    }
+
+    SelectionSetting {
+        settingKey: "cutoutModel"
+        label: "AI Subject Cutout Model"
+        description: "IS-Net uses ~1 GB RAM (85% less RAM than BiRefNet's ~6.9 GB). U2-Net uses ~700 MB for low-RAM PCs."
+        options: [
+            { label: "IS-Net General (Recommended • ~1.0 GB RAM)", value: "isnet-general-use" },
+            { label: "IS-Net Anime & Illustration (~1.1 GB RAM)", value: "isnet-anime" },
+            { label: "U2-Net Standard (Low RAM • ~700 MB RAM)", value: "u2net" },
+            { label: "U2-Net Lite (Ultra-Low RAM • ~500 MB RAM)", value: "u2netp" },
+            { label: "BiRefNet Lite (High RAM • ~6.9 GB RAM)", value: "birefnet-general-lite" }
+        ]
+        defaultValue: "isnet-general-use"
+    }
+
+    SliderSetting {
+        settingKey: "maxThreads"
+        label: "Max CPU Threads for Cutouts"
+        description: "Caps ONNX Runtime & OpenCV thread usage so background cutouts never spike CPU to 100%"
+        minimum: 1
+        maximum: 8
+        defaultValue: 2
+    }
+
+    ToggleSetting {
+        settingKey: "autoWarm"
+        label: "Auto Pre-Warm Entire Folder in Background"
+        description: "Off by default to prevent CPU/RAM usage on startup. Outlines are generated on-demand when you pick a wallpaper (or when clicking Pre-Warm Outlines)."
+        defaultValue: false
+    }
+
     // ─────────────────── Duration & Advanced Stage Timing ───────────────────
     StyledText {
         text: "Duration & Stage Timing"
