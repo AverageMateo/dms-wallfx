@@ -672,6 +672,7 @@ PluginComponent {
                     stage.forceActiveFocus()
                     root.refreshThumbs()
                     root.warmTransitions()
+                    carousel.ensureLoopCentered()
                 }
             }
 
@@ -688,8 +689,9 @@ PluginComponent {
                     carousel.incrementCurrentIndex()
                     event.accepted = true
                 } else if (event.key === Qt.Key_R) {
-                    if (wallModel.count > 0) {
-                        carousel.currentIndex = Math.floor(Math.random() * wallModel.count)
+                    if (carousel.realCount > 1) {
+                        const step = 1 + Math.floor(Math.random() * (carousel.realCount - 1))
+                        carousel.currentIndex += (Math.random() < 0.5 ? step : -step)
                     }
                     event.accepted = true
                 }
@@ -724,7 +726,16 @@ PluginComponent {
                 }
                 height: 560
                 orientation: ListView.Horizontal
-                model: wallModel
+                readonly property int loopMultiplier: 200
+                readonly property int baseCycle: 100
+                readonly property int realCount: wallModel.count
+                readonly property int realCurrentIndex: realCount > 0 && currentIndex >= 0
+                    ? ((currentIndex % realCount) + realCount) % realCount
+                    : 0
+                property bool instantJump: false
+                property bool initializedLoop: false
+
+                model: realCount > 0 ? realCount * loopMultiplier : 0
                 property real iw: 720
                 property real ih: 406
                 property real skew: -0.35
@@ -738,15 +749,61 @@ PluginComponent {
                 highlightRangeMode: ListView.StrictlyEnforceRange
                 preferredHighlightBegin: (width - slotW) / 2
                 preferredHighlightEnd: (width + slotW) / 2
-                highlightMoveDuration: 420
-                highlightMoveVelocity: 3000
+                highlightMoveDuration: instantJump ? 0 : 420
+                highlightMoveVelocity: instantJump ? -1 : 3000
                 snapMode: ListView.SnapToItem
                 boundsBehavior: Flickable.StopAtBounds
                 maximumFlickVelocity: 6000
 
+                function jumpToRealIndex(rIdx) {
+                    if (realCount <= 0) return
+                    const clamped = ((rIdx % realCount) + realCount) % realCount
+                    const targetVirtual = baseCycle * realCount + clamped
+                    instantJump = true
+                    currentIndex = targetVirtual
+                    positionViewAtIndex(targetVirtual, ListView.Center)
+                    instantJump = false
+                    initializedLoop = true
+                }
+
+                function findActiveRealIndex() {
+                    const active = SessionData.wallpaperPath || root.currentWallpaper
+                    if (active && realCount > 0) {
+                        for (let i = 0; i < realCount; i++) {
+                            if (root.originalOf(wallModel.get(i, "fileName")) === active) {
+                                return i
+                            }
+                        }
+                    }
+                    return realCurrentIndex
+                }
+
+                function ensureLoopCentered() {
+                    if (realCount <= 0) return
+                    if (!initializedLoop) {
+                        jumpToRealIndex(findActiveRealIndex())
+                    } else if (currentIndex < 20 * realCount || currentIndex > 180 * realCount) {
+                        jumpToRealIndex(realCurrentIndex)
+                    }
+                }
+
+                onRealCountChanged: {
+                    if (realCount > 0) {
+                        Qt.callLater(ensureLoopCentered)
+                    } else {
+                        initializedLoop = false
+                    }
+                }
+
+                onMovingChanged: {
+                    if (!moving && realCount > 0 && (currentIndex < 20 * realCount || currentIndex > 180 * realCount)) {
+                        jumpToRealIndex(realCurrentIndex)
+                    }
+                }
+
                 function applyCurrent() {
-                    if (currentIndex < 0 || wallModel.count <= currentIndex) return
-                    const targetPath = root.originalOf(wallModel.get(currentIndex, "fileName"))
+                    if (realCount <= 0) return
+                    const targetPath = root.originalOf(wallModel.get(realCurrentIndex, "fileName"))
                     root.carouselOpen = false
                     root.triggerTransition(targetPath, false)
                 }
@@ -755,6 +812,10 @@ PluginComponent {
                     id: slot
                     width: carousel.slotW
                     height: carousel.height
+                    readonly property int realIdx: carousel.realCount > 0 ? (index % carousel.realCount) : 0
+                    readonly property url thumbUrl: carousel.realCount > 0
+                        ? (wallModel.get(realIdx, "fileUrl") || "")
+                        : ""
                     readonly property real d: (x + width / 2 - (carousel.contentX + carousel.width / 2)) / carousel.slotW
                     readonly property real ad: Math.abs(d)
                     readonly property real sc: ad <= 1
@@ -795,7 +856,7 @@ PluginComponent {
                                 width: carousel.imgW
                                 height: carousel.ih
                                 fillMode: Image.PreserveAspectCrop
-                                source: model.fileUrl
+                                source: slot.thumbUrl
                                 asynchronous: true
                                 cache: true
                                 mipmap: true
@@ -827,7 +888,7 @@ PluginComponent {
                     bottom: parent.bottom
                     bottomMargin: 44
                 }
-                visible: wallModel.count > 0
+                visible: carousel.realCount > 0
                 height: 42
                 width: hudRow.implicitWidth + 36
                 radius: 21
@@ -842,8 +903,8 @@ PluginComponent {
 
                     StyledText {
                         text: {
-                            if (carousel.currentIndex < 0 || wallModel.count <= carousel.currentIndex) return ""
-                            return String(wallModel.get(carousel.currentIndex, "fileName")).replace(/\.jpg$/, "")
+                            if (carousel.realCount <= 0) return ""
+                            return String(wallModel.get(carousel.realCurrentIndex, "fileName")).replace(/\.jpg$/, "")
                         }
                         color: Theme.surfaceText
                         font.pixelSize: Theme.fontSizeMedium
@@ -851,7 +912,7 @@ PluginComponent {
                     }
 
                     StyledText {
-                        text: (carousel.currentIndex + 1) + " / " + wallModel.count
+                        text: (carousel.realCurrentIndex + 1) + " / " + carousel.realCount
                         color: Theme.primary
                         font.pixelSize: Theme.fontSizeSmall
                         font.weight: Font.Bold
