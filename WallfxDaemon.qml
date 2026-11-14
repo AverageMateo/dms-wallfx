@@ -649,7 +649,7 @@ PluginComponent {
                 property vector4d cropNew: fxWin.crop(newImg)
                 property color ember: root.ember
                 property color ink: root.ink
-                fragmentShader: Qt.resolvedUrl("shaders/wallfx.v16.frag.qsb")
+                fragmentShader: Qt.resolvedUrl("shaders/wallfx.v17.frag.qsb")
             }
         }
     }

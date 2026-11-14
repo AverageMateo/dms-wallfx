@@ -334,7 +334,7 @@ def perfil(img, force=False, model_name=DEFAULT_MODEL, num_threads=DEFAULT_THREA
         im = Image.open(img).convert("RGB")
         im.thumbnail((FIELD_MAX, FIELD_MAX))
         mask_path = base + "-mascara.png"
-        if not force and os.path.exists(mask_path):
+        if os.path.exists(mask_path):
             mask = Image.open(mask_path).convert("L")
         else:
             raw_mask = _cutout(im, model_name=model_name, num_threads=num_threads)
@@ -358,9 +358,15 @@ def perfil(img, force=False, model_name=DEFAULT_MODEL, num_threads=DEFAULT_THREA
                 json.dump(meta, f)
             return None
 
+        # Smooth staircase jaggies on the binary mask before contour & distance extraction
+        b_smooth = cv2.GaussianBlur(b.astype(np.float32), (0, 0), 1.15)
+        b = (b_smooth >= 0.5).astype(np.uint8)
+
         din = cv2.distanceTransform(b, cv2.DIST_L2, 5)
         dout = cv2.distanceTransform(1 - b, cv2.DIST_L2, 5)
-        sd = dout - din
+        # Sub-pixel signed distance with Gaussian smoothing to eliminate pixel-grid stair-stepping
+        sd_raw = (dout - din) + (0.5 - np.clip(m, 0.0, 1.0)) * 0.85
+        sd = cv2.GaussianBlur(sd_raw.astype(np.float32), (0, 0), 1.15)
 
         inner = np.clip(din / max(float(np.percentile(din[b > 0], 99)), 1.0), 0, 1)
 

@@ -68,6 +68,39 @@ vec2 newUv(vec2 uv, float z) {
     return cropNew.xy + cam(uv, z) * cropNew.zw;
 }
 
+// Fast 4-tap hardware-bilinear Cubic B-Spline filter.
+// Converts 8-bit 1280p SDF textures into C2-continuous vector-smooth curves with zero staircase artifacts.
+vec4 textureBicubic(sampler2D tex, vec2 uv, vec2 texSize) {
+    vec2 coord = uv * texSize - 0.5;
+    vec2 f = fract(coord);
+    vec2 i = floor(coord);
+
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+
+    vec2 w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+    vec2 w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+    vec2 w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+    vec2 w3 = f3 / 6.0;
+
+    vec2 g0 = w0 + w1;
+    vec2 g1 = w2 + w3;
+
+    vec2 h0 = (i - 0.5 + w1 / g0) / texSize;
+    vec2 h1 = (i + 1.5 + w3 / g1) / texSize;
+
+    vec4 tex00 = texture(tex, vec2(h0.x, h0.y));
+    vec4 tex10 = texture(tex, vec2(h1.x, h0.y));
+    vec4 tex01 = texture(tex, vec2(h0.x, h1.y));
+    vec4 tex11 = texture(tex, vec2(h1.x, h1.y));
+
+    return mix(
+        mix(tex00, tex10, g1.x),
+        mix(tex01, tex11, g1.x),
+        g1.y
+    );
+}
+
 // 16-bit surface in lineTex's G (high) and B (low), bilinearly interpolated in float
 float s16(vec2 texel) {
     texel = clamp(texel, vec2(0.0), vec2(lw, lh) - 1.0);
@@ -90,7 +123,7 @@ float surface(vec2 tuv) {
 float arrivalAt(vec2 c) {
     c = clamp(c, vec2(0.0), vec2(fw, fh) - 1.0);
     vec4 f = texture(fieldTex, (c + 0.5) / vec2(fw, fh));
-    return (floor(f.r * 255.0 + 0.5) * 256.0 + floor(f.b * 0.0 + f.g * 255.0 + 0.5)) / 65535.0;
+    return (floor(f.r * 255.0 + 0.5) * 256.0 + floor(f.g * 255.0 + 0.5)) / 65535.0;
 }
 
 vec3 contagion(vec2 uv) {
@@ -131,9 +164,15 @@ vec3 contagion(vec2 uv) {
 vec3 outline(vec2 uv) {
     float zCh = 1.0 + parallax * (1.0 - escena(t));
     float zBg = 1.0 + (parallax * 0.5) * (1.0 - escena(t));
-    vec4 f = texture(fieldTex, newUv(uv, zCh));
-    float sdPx = (f.b * 2.0 - 1.0) * sdRange * sw * zCh / (fw * cropNew.z);
-    float inside = clamp(0.5 - sdPx / max(fwidth(sdPx), 1e-3), 0.0, 1.0);
+    vec2 nuvCh = newUv(uv, zCh);
+
+    // Sample the signed distance field with C2 bicubic B-spline filtering to eliminate texel staircase
+    vec4 f = textureBicubic(fieldTex, nuvCh, vec2(fw, fh));
+    float mapToScreenPx = sw * zCh / (fw * cropNew.z);
+    float sdPx = (f.b * 2.0 - 1.0) * sdRange * mapToScreenPx;
+
+    // True screen-pixel antialiasing (no noisy 8-bit texel fwidth artifacts)
+    float inside = smoothstep(0.9, -0.9, sdPx);
 
     // Stage dimming: darken and desaturate the old wallpaper according to stageDim
     float dimRamp = escena(t / max(tDrawStart + tDrawDur * 0.5, 0.08));
@@ -150,7 +189,7 @@ vec3 outline(vec2 uv) {
     // Stage 2: Character interior fills inward from silhouette
     float Ti = escena((t - tFillStart) / max(tFillDur, 0.001)) * 1.02 - 0.01;
     float inDepth = texture(fieldTex, newUv(cuv, zCh)).g;
-    vec3 cIn = inDepth <= Ti ? texture(newTex, newUv(uv, zCh)).rgb : st;
+    vec3 cIn = inDepth <= Ti ? texture(newTex, nuvCh).rgb : st;
 
     // Stage 3: Background erupts outward from silhouette
     float To = escena((t - tBgStart) / max(tBgDur, 0.001)) * 1.02 - 0.01;
@@ -160,27 +199,30 @@ vec3 outline(vec2 uv) {
 
     // Stage 1: Two pen strokes trace the character silhouette from top to bottom
     float drawP = escena((t - tDrawStart) / max(tDrawDur, 0.001));
-    float lp = texture(lineTex, newUv(uv, zCh)).r;
+    float lp = texture(lineTex, nuvCh).r;
     float fade = 1.0 - escena((t - tBgStart) / max(tBgDur * 0.55, 0.05));
-    if (lp > 0.0 && lp <= drawP && fade > 0.0) {
-        float d = abs(sdPx) - lineW * 0.5;
-        float core = clamp(0.5 - d / max(fwidth(sdPx), 1e-3), 0.0, 1.0);
-        c = mix(c, ink.rgb, core * 0.85 * fade);
+    if (lp > 0.0 && fade > 0.0) {
+        // Smooth pen-tip progression instead of hard single-texel cutoff
+        float tipMask = smoothstep(-0.004, 0.014, drawP - lp);
+        if (tipMask > 0.0) {
+            float halfW = max(lineW * 0.5, 0.4);
+            float d = abs(sdPx) - halfW;
+            // Crisp screen-space antialiased core + subtle 1.2px brush edge softness
+            float core = smoothstep(1.15, -0.85, d) * tipMask;
+            c = mix(c, ink.rgb, core * 0.88 * fade);
 
-        // Optional Character Silhouette Neon Aura (controlled by outlineGlow)
-        if (outlineGlow > 0.001) {
-            float halo = exp(-max(abs(sdPx) - lineW * 0.3, 0.0) / (6.0 + 10.0 * outlineGlow));
-            float tipBoost = 1.0 + 0.8 * exp(-max(drawP - lp, 0.0) / 0.04);
-            c += mix(ember.rgb, ink.rgb, 0.35) * halo * tipBoost * 0.55 * outlineGlow * fade;
+            if (outlineGlow > 0.001) {
+                float halo = exp(-max(d, 0.0) / (5.0 + 10.0 * outlineGlow)) * tipMask;
+                float tipBoost = 1.0 + 0.85 * exp(-max(drawP - lp, 0.0) / 0.035);
+                c += mix(ember.rgb, ink.rgb, 0.35) * halo * tipBoost * 0.55 * outlineGlow * fade;
+            }
         }
     }
 
     // Optional outer aura & shockwave rim glow when outlineGlow > 0
     if (outlineGlow > 0.001) {
         float energy = sin(PI * t);
-        // Wide outer character aura from fieldTex.r (0 at silhouette -> 1 at 48 map px outside)
         float aura = (1.0 - inside) * exp(-f.r * 4.5) * fade * clamp(drawP * 1.5, 0.0, 1.0);
-        // Glowing rim riding the inward character fill & outward background wave
         float inRim = inside * exp(-abs(inDepth - Ti) / 0.025) * step(0.001, Ti) * step(Ti, 0.999);
         float outRim = (1.0 - inside) * exp(-abs(outOrder - To) / 0.012) * step(0.001, To) * step(To, 0.999);
         c += ember.rgb * outlineGlow * energy * (0.38 * aura + 0.35 * inRim + 0.30 * outRim);
